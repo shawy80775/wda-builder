@@ -68,18 +68,26 @@ jobs:
 
       - name: Embed lib_TestingInterop.dylib (fix iOS<18 launch crash)
         # Xcode 16's Testing.framework references @rpath/lib_TestingInterop.dylib, absent on iOS<18.
-        # Copy it from the iOS SDK into the app Frameworks (which is on @rpath) so dyld can resolve it.
+        # Copy it from the iOS SDK / Xcode into the app Frameworks (on @rpath) so dyld can resolve it.
         run: |
           cd WebDriverAgent
           DST="Payload/WebDriverAgentRunner-Runner.app/Frameworks"
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          LIB=$(find "$SDK" -name "lib_TestingInterop.dylib" 2>/dev/null | head -1)
+          echo "SDK=$SDK"
+          echo "--- usr/lib/swift (Testing*):"
+          ls -la "$SDK/usr/lib/swift/" 2>/dev/null | grep -i testing || echo "(none in usr/lib/swift)"
+          echo "--- System/iOSSupport swift:"
+          ls -la "$SDK/System/iOSSupport/usr/lib/swift/" 2>/dev/null | grep -i testing || echo "(none in iOSSupport)"
+          echo "--- broad search for lib_TestingInterop*.dylib:"
+          LIB=$(find /Applications/Xcode.app -name "lib_TestingInterop*.dylib" 2>/dev/null | head -1)
+          echo "LIB=$LIB"
           if [ -n "$LIB" ]; then
             cp "$LIB" "$DST/"
-            echo "Embedded $LIB -> $DST/"
+            echo "Embedded $LIB"
             ls -la "$DST/lib_TestingInterop.dylib"
           else
-            echo "!! lib_TestingInterop.dylib NOT found in SDK ($SDK); WDA will crash on iOS<18"
+            echo "!! lib_TestingInterop.dylib NOT found anywhere; fallback listing:"
+            find /Applications/Xcode.app -iname "*TestingInterop*" 2>/dev/null | head
             exit 1
           fi
 
