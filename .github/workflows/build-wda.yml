@@ -28,7 +28,7 @@ jobs:
         # Xcode 15.4 uses the classic XCTest with no such dependency, so it runs fine on iOS 16/17.
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '${{ github.event.inputs.xcode_version || '15.4' }}'
+          xcode-version: "${{ github.event.inputs.xcode_version || '15.4' }}"
 
       - name: Show Xcode / environment
         run: |
