@@ -7,19 +7,31 @@ on:
         description: 'WebDriverAgent tag to build'
         required: false
         default: 'v16.15.3'
+      xcode_version:
+        description: 'Xcode version to build with (15.4 avoids the iOS<18 lib_TestingInterop crash)'
+        required: false
+        default: '15.4'
   push:
     branches: [main]
 
 jobs:
   build:
-    runs-on: macos-latest
+    # macos-14 ships Xcode 15.x by default; we also pin explicitly below.
+    runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Select Xcode version
+        # Xcode 16's XCTest links Testing.framework which needs lib_TestingInterop.dylib,
+        # a library that does NOT exist on iOS < 18 -> WDA crashes at launch (dyld SIGABRT).
+        # Xcode 15.4 uses the classic XCTest with no such dependency, so it runs fine on iOS 16/17.
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '${{ github.event.inputs.xcode_version || '15.4' }}'
+
       - name: Show Xcode / environment
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
           uname -a
@@ -65,6 +77,34 @@ jobs:
           fi
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
+
+      - name: Defensive fix - embed lib_TestingInterop.dylib if referenced
+        # Safeguard for any Xcode >= 16 build: the app may link Testing.framework which
+        # needs lib_TestingInterop.dylib at runtime on iOS < 18. Copy it from the SDK so
+        # dyld can resolve it. On Xcode 15.4 this file does not exist in the SDK, so it's a no-op.
+        run: |
+          cd WebDriverAgent
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          DST="Payload/WebDriverAgentRunner-Runner.app/Frameworks"
+          for p in "$SDK/usr/lib/swift/lib_TestingInterop.dylib" "$SDK/usr/lib/lib_TestingInterop.dylib"; do
+            if [ -f "$p" ]; then
+              cp "$p" "$DST/"
+              echo "Embedded $p -> $DST/"
+              break
+            fi
+          done
+          # Sanity: fail the build early if the app still references a missing dylib
+          if grep -rl "lib_TestingInterop" "Payload/WebDriverAgentRunner-Runner.app" >/dev/null 2>&1; then
+            if [ ! -f "$DST/lib_TestingInterop.dylib" ]; then
+              echo "!! lib_TestingInterop referenced but NOT embedded - build will crash on iOS<18"
+              exit 1
+            fi
+          fi
+
+      - name: Zip IPA (unsigned)
+        run: |
+          cd WebDriverAgent
+          rm -f WebDriverAgent.ipa
           zip -r WebDriverAgent.ipa Payload
           ls -la WebDriverAgent.ipa
 
