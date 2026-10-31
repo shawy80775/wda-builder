@@ -12,13 +12,11 @@ on:
 
 jobs:
   build:
-    # macos-latest is the only runner reliably available on this account.
-    # It now ships a very new Xcode (>=16) whose XCTest embeds Testing.framework,
-    # which at launch references @rpath/lib_TestingInterop.dylib -- a library that
-    # does NOT exist on iOS < 18, so WDA dies with a dyld SIGABRT.
-    # Fix: delete Testing.framework from the built app bundle before packaging.
-    # WDA does not use Swift Testing, so removing it is safe and lets WDA launch
-    # cleanly on iOS 16/17.
+    # macos-latest is the only runner reliably available on this account (currently Xcode 26).
+    # Xcode 26's XCTest embeds a reference to @rpath/lib_TestingInterop.dylib, which does NOT
+    # exist on iOS < 18 -> WDA dies with a dyld SIGABRT at launch.
+    # Fix: drop Testing.framework (WDA never uses Swift Testing) and ship a stub
+    # lib_TestingInterop.dylib so dyld can resolve the reference on iOS 16/17.
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -69,29 +67,46 @@ jobs:
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
 
-      - name: Remove Testing.framework (fix iOS<18 launch crash)
-        # Xcode>=16 embeds Testing.framework which needs lib_TestingInterop.dylib
-        # (absent on iOS<18). WDA never uses Swift Testing, so delete it from the
-        # bundle so dyld won't try to load it at launch.
+      - name: Fix lib_TestingInterop.dylib (iOS<18 launch crash)
         run: |
           cd WebDriverAgent
           APP="Payload/WebDriverAgentRunner-Runner.app"
-          TF="$APP/Frameworks/Testing.framework"
-          if [ -d "$TF" ]; then
-            echo "Testing.framework present -> removing it"
-            rm -rf "$TF"
-            echo "Removed $TF"
+          DST="$APP/Frameworks"
+          mkdir -p "$DST"
+
+          # 1) Remove Testing.framework (its binary needs the dylib; WDA doesn't use Swift Testing)
+          if [ -d "$DST/Testing.framework" ]; then
+            rm -rf "$DST/Testing.framework"
+            echo "removed Testing.framework"
           else
-            echo "No Testing.framework in bundle (Xcode<16 build) -> nothing to remove"
+            echo "no Testing.framework in bundle"
           fi
-          echo "=== remaining frameworks ==="
-          ls -1 "$APP/Frameworks" 2>/dev/null || echo "(no Frameworks dir)"
-          echo "=== sanity: any leftover reference to lib_TestingInterop? ==="
-          if grep -rl "lib_TestingInterop" "$APP" >/dev/null 2>&1; then
-            echo "!! still references lib_TestingInterop -- build will crash"
-            exit 1
+
+          # 2) Provide lib_TestingInterop.dylib at @rpath so dyld can resolve the reference.
+          #    Prefer the real dylib if present on the build host (macOS SDK often has it);
+          #    otherwise compile a tiny stub that satisfies the load.
+          LIB=$(find /Applications/Xcode.app -name "lib_TestingInterop.dylib" 2>/dev/null | head -1)
+          if [ -n "$LIB" ]; then
+            cp "$LIB" "$DST/"
+            echo "copied real dylib from $LIB"
           else
-            echo "OK: no lib_TestingInterop reference in app bundle"
+            echo "real dylib not found on host -> building stub"
+            SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+            echo 'void _wda_testing_interop_stub(void){}' > /tmp/wda_stub.c
+            clang -dynamiclib -arch arm64 \
+              -isysroot "$SDK" -mios-version-min=16.0 \
+              -install_name @rpath/lib_TestingInterop.dylib \
+              -o "$DST/lib_TestingInterop.dylib" /tmp/wda_stub.c
+          fi
+          echo "=== dylib in bundle ==="
+          ls -la "$DST/lib_TestingInterop.dylib"
+
+          # 3) Sanity: the dylib must physically exist in the bundle
+          if [ -f "$DST/lib_TestingInterop.dylib" ]; then
+            echo "OK: lib_TestingInterop.dylib present in Frameworks -> dyld will resolve it on iOS<18"
+          else
+            echo "!! lib_TestingInterop.dylib missing -> WDA will crash on iOS<18"
+            exit 1
           fi
 
       - name: Zip IPA (unsigned)
