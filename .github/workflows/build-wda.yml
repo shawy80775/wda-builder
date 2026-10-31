@@ -12,11 +12,11 @@ on:
 
 jobs:
   build:
-    # macos-latest (Xcode 16) is proven to run on this repo. Xcode 16's XCTest links
-    # Testing.framework which needs lib_TestingInterop.dylib at runtime -- a library
-    # that does NOT exist on iOS < 18, so WDA crashes at launch (dyld SIGABRT).
-    # Fix: embed that dylib from the SDK into the app bundle during packaging.
-    runs-on: macos-latest
+    # macos-13 ships Xcode 15.x. Xcode 15's XCTest does NOT link Testing.framework,
+    # so there is no lib_TestingInterop.dylib dependency -> WDA runs fine on iOS 16/17.
+    # (macos-latest is now Xcode 26.6 which reintroduces the iOS<18 crash; macos-14 is
+    #  unavailable on this account, so we use macos-13.)
+    runs-on: macos-13
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,29 +66,25 @@ jobs:
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
 
-      - name: Embed lib_TestingInterop.dylib (fix iOS<18 launch crash)
-        # Xcode 16's Testing.framework references @rpath/lib_TestingInterop.dylib, absent on iOS<18.
-        # Copy it from the iOS SDK / Xcode into the app Frameworks (on @rpath) so dyld can resolve it.
+      - name: Embed lib_TestingInterop.dylib if needed (Xcode>=16 safeguard)
+        # Only relevant when the bundle references it (Xcode>=16). On Xcode 15 there is
+        # nothing to embed. If it IS referenced but the dylib can't be found, fail loudly.
         run: |
           cd WebDriverAgent
           DST="Payload/WebDriverAgentRunner-Runner.app/Frameworks"
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK=$SDK"
-          echo "--- usr/lib/swift (Testing*):"
-          ls -la "$SDK/usr/lib/swift/" 2>/dev/null | grep -i testing || echo "(none in usr/lib/swift)"
-          echo "--- System/iOSSupport swift:"
-          ls -la "$SDK/System/iOSSupport/usr/lib/swift/" 2>/dev/null | grep -i testing || echo "(none in iOSSupport)"
-          echo "--- broad search for lib_TestingInterop*.dylib:"
-          LIB=$(find /Applications/Xcode.app -name "lib_TestingInterop*.dylib" 2>/dev/null | head -1)
-          echo "LIB=$LIB"
-          if [ -n "$LIB" ]; then
-            cp "$LIB" "$DST/"
-            echo "Embedded $LIB"
-            ls -la "$DST/lib_TestingInterop.dylib"
+          if grep -rl "lib_TestingInterop" "Payload/WebDriverAgentRunner-Runner.app" >/dev/null 2>&1; then
+            echo "Testing.framework present -> embedding lib_TestingInterop.dylib"
+            SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+            LIB=$(find /Applications/Xcode.app "$SDK" -name "lib_TestingInterop.dylib" 2>/dev/null | head -1)
+            if [ -n "$LIB" ]; then
+              cp "$LIB" "$DST/"
+              echo "Embedded $LIB"
+            else
+              echo "!! lib_TestingInterop.dylib missing on this Xcode; cannot fix"
+              exit 1
+            fi
           else
-            echo "!! lib_TestingInterop.dylib NOT found anywhere; fallback listing:"
-            find /Applications/Xcode.app -iname "*TestingInterop*" 2>/dev/null | head
-            exit 1
+            echo "No lib_TestingInterop reference -> Xcode 15 build, nothing to embed"
           fi
 
       - name: Zip IPA (unsigned)
