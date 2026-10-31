@@ -1,39 +1,46 @@
 name: Build WebDriverAgent IPA
 
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      wda_tag:
+        description: 'WebDriverAgent tag to build'
+        required: false
+        default: 'v16.15.3'
   push:
     branches: [main]
 
 jobs:
   build:
     runs-on: macos-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clone WebDriverAgent
+      - name: Show Xcode / environment
         run: |
-          git clone https://github.com/appium/WebDriverAgent.git
-          cd WebDriverAgent
-          git fetch --tags
-          echo "WDA Version: $(git describe --tags --always)"
-
-      - name: Show Xcode version
-        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
+          uname -a
 
-      - name: Build WebDriverAgent for iOS Device
+      - name: Clone WebDriverAgent (pinned tag)
+        run: |
+          TAG="${{ github.event.inputs.wda_tag || 'v16.15.3' }}"
+          echo "Building WDA $TAG"
+          git clone --depth 1 --branch "$TAG" https://github.com/appium/WebDriverAgent.git
+          cd WebDriverAgent
+          echo "WDA Version: $(git describe --tags --always)"
+
+      - name: Build WebDriverAgent (unsigned, for Sideloadly re-sign)
         run: |
           cd WebDriverAgent
-
-          # Build for generic iOS device (no signing - will be re-signed with Sideloadly)
+          set -o pipefail
           xcodebuild build-for-testing \
             -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
             -destination 'generic/platform=iOS' \
+            -configuration Debug \
             -derivedDataPath ./build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -41,30 +48,24 @@ jobs:
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            -allowProvisioningUpdates
+            ONLY_ACTIVE_ARCH=NO \
+            -allowProvisioningUpdates 2>&1 | tail -n 150
 
       - name: Find and Package App
         run: |
           cd WebDriverAgent
-
-          # Find the built .app
           APP_PATH=$(find ./build -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
           echo "Found app at: $APP_PATH"
-
           if [ -z "$APP_PATH" ]; then
-            echo "App not found, listing build directory:"
+            echo "!! App not found. Build products:"
             find ./build -name "*.app" -type d
+            echo "=== any xcbuild logs ==="
+            find ./build -name "*.xcactivitylog" | head
             exit 1
           fi
-
-          # Create Payload directory for IPA
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
-
-          # Create IPA
           zip -r WebDriverAgent.ipa Payload
-
-          echo "IPA created successfully!"
           ls -la WebDriverAgent.ipa
 
       - name: Upload IPA Artifact
@@ -73,27 +74,3 @@ jobs:
           name: WebDriverAgent-IPA
           path: WebDriverAgent/WebDriverAgent.ipa
           retention-days: 30
-
-      - name: Create Release
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: wda-${{ github.run_number }}
-          name: WebDriverAgent Build ${{ github.run_number }}
-          files: WebDriverAgent/WebDriverAgent.ipa
-          body: |
-            ## WebDriverAgent IPA
-
-            Built from appium/WebDriverAgent
-
-            ### Installation:
-            1. Download `WebDriverAgent.ipa`
-            2. Open Sideloadly
-            3. Drag the IPA into Sideloadly
-            4. Enter your Apple ID
-            5. Click Start
-
-            ### After Installation:
-            - Trust the app: Settings > General > VPN & Device Management
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
