@@ -7,19 +7,16 @@ on:
         description: 'WebDriverAgent tag to build'
         required: false
         default: 'v16.15.3'
-      xcode_version:
-        description: 'Xcode version to build with (15.4 avoids the iOS<18 lib_TestingInterop crash)'
-        required: false
-        default: '15.4'
   push:
     branches: [main]
 
 jobs:
   build:
-    # macos-14 runners default to Xcode 15.4, whose XCTest has no Testing.framework
-    # dependency -> avoids the iOS<18 lib_TestingInterop.dylib crash. (No extra
-    # Xcode-select step needed; that also avoids third-party action issues on forks.)
-    runs-on: macos-14
+    # macos-latest (Xcode 16) is proven to run on this repo. Xcode 16's XCTest links
+    # Testing.framework which needs lib_TestingInterop.dylib at runtime -- a library
+    # that does NOT exist on iOS < 18, so WDA crashes at launch (dyld SIGABRT).
+    # Fix: embed that dylib from the SDK into the app bundle during packaging.
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,7 +25,6 @@ jobs:
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
-          uname -a
 
       - name: Clone WebDriverAgent (pinned tag)
         run: |
@@ -65,34 +61,26 @@ jobs:
           if [ -z "$APP_PATH" ]; then
             echo "!! App not found. Build products:"
             find ./build -name "*.app" -type d
-            echo "=== any xcbuild logs ==="
-            find ./build -name "*.xcactivitylog" | head
             exit 1
           fi
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
 
-      - name: Defensive fix - embed lib_TestingInterop.dylib if referenced
-        # Safeguard for any Xcode >= 16 build: the app may link Testing.framework which
-        # needs lib_TestingInterop.dylib at runtime on iOS < 18. Copy it from the SDK so
-        # dyld can resolve it. On Xcode 15.4 this file does not exist in the SDK, so it's a no-op.
+      - name: Embed lib_TestingInterop.dylib (fix iOS<18 launch crash)
+        # Xcode 16's Testing.framework references @rpath/lib_TestingInterop.dylib, absent on iOS<18.
+        # Copy it from the iOS SDK into the app Frameworks (which is on @rpath) so dyld can resolve it.
         run: |
           cd WebDriverAgent
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           DST="Payload/WebDriverAgentRunner-Runner.app/Frameworks"
-          for p in "$SDK/usr/lib/swift/lib_TestingInterop.dylib" "$SDK/usr/lib/lib_TestingInterop.dylib"; do
-            if [ -f "$p" ]; then
-              cp "$p" "$DST/"
-              echo "Embedded $p -> $DST/"
-              break
-            fi
-          done
-          # Sanity: fail the build early if the app still references a missing dylib
-          if grep -rl "lib_TestingInterop" "Payload/WebDriverAgentRunner-Runner.app" >/dev/null 2>&1; then
-            if [ ! -f "$DST/lib_TestingInterop.dylib" ]; then
-              echo "!! lib_TestingInterop referenced but NOT embedded - build will crash on iOS<18"
-              exit 1
-            fi
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          LIB=$(find "$SDK" -name "lib_TestingInterop.dylib" 2>/dev/null | head -1)
+          if [ -n "$LIB" ]; then
+            cp "$LIB" "$DST/"
+            echo "Embedded $LIB -> $DST/"
+            ls -la "$DST/lib_TestingInterop.dylib"
+          else
+            echo "!! lib_TestingInterop.dylib NOT found in SDK ($SDK); WDA will crash on iOS<18"
+            exit 1
           fi
 
       - name: Zip IPA (unsigned)
