@@ -12,11 +12,14 @@ on:
 
 jobs:
   build:
-    # macos-13 ships Xcode 15.x. Xcode 15's XCTest does NOT link Testing.framework,
-    # so there is no lib_TestingInterop.dylib dependency -> WDA runs fine on iOS 16/17.
-    # (macos-latest is now Xcode 26.6 which reintroduces the iOS<18 crash; macos-14 is
-    #  unavailable on this account, so we use macos-13.)
-    runs-on: macos-13
+    # macos-latest is the only runner reliably available on this account.
+    # It now ships a very new Xcode (>=16) whose XCTest embeds Testing.framework,
+    # which at launch references @rpath/lib_TestingInterop.dylib -- a library that
+    # does NOT exist on iOS < 18, so WDA dies with a dyld SIGABRT.
+    # Fix: delete Testing.framework from the built app bundle before packaging.
+    # WDA does not use Swift Testing, so removing it is safe and lets WDA launch
+    # cleanly on iOS 16/17.
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,25 +69,29 @@ jobs:
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
 
-      - name: Embed lib_TestingInterop.dylib if needed (Xcode>=16 safeguard)
-        # Only relevant when the bundle references it (Xcode>=16). On Xcode 15 there is
-        # nothing to embed. If it IS referenced but the dylib can't be found, fail loudly.
+      - name: Remove Testing.framework (fix iOS<18 launch crash)
+        # Xcode>=16 embeds Testing.framework which needs lib_TestingInterop.dylib
+        # (absent on iOS<18). WDA never uses Swift Testing, so delete it from the
+        # bundle so dyld won't try to load it at launch.
         run: |
           cd WebDriverAgent
-          DST="Payload/WebDriverAgentRunner-Runner.app/Frameworks"
-          if grep -rl "lib_TestingInterop" "Payload/WebDriverAgentRunner-Runner.app" >/dev/null 2>&1; then
-            echo "Testing.framework present -> embedding lib_TestingInterop.dylib"
-            SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-            LIB=$(find /Applications/Xcode.app "$SDK" -name "lib_TestingInterop.dylib" 2>/dev/null | head -1)
-            if [ -n "$LIB" ]; then
-              cp "$LIB" "$DST/"
-              echo "Embedded $LIB"
-            else
-              echo "!! lib_TestingInterop.dylib missing on this Xcode; cannot fix"
-              exit 1
-            fi
+          APP="Payload/WebDriverAgentRunner-Runner.app"
+          TF="$APP/Frameworks/Testing.framework"
+          if [ -d "$TF" ]; then
+            echo "Testing.framework present -> removing it"
+            rm -rf "$TF"
+            echo "Removed $TF"
           else
-            echo "No lib_TestingInterop reference -> Xcode 15 build, nothing to embed"
+            echo "No Testing.framework in bundle (Xcode<16 build) -> nothing to remove"
+          fi
+          echo "=== remaining frameworks ==="
+          ls -1 "$APP/Frameworks" 2>/dev/null || echo "(no Frameworks dir)"
+          echo "=== sanity: any leftover reference to lib_TestingInterop? ==="
+          if grep -rl "lib_TestingInterop" "$APP" >/dev/null 2>&1; then
+            echo "!! still references lib_TestingInterop -- build will crash"
+            exit 1
+          else
+            echo "OK: no lib_TestingInterop reference in app bundle"
           fi
 
       - name: Zip IPA (unsigned)
